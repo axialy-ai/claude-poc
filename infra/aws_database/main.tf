@@ -115,7 +115,7 @@ resource "aws_db_instance" "axialy" {
   monitoring_interval         = 60
   monitoring_role_arn        = aws_iam_role.rds_monitoring.arn
   
-  enabled_cloudwatch_logs_exports = ["error", "general", "slow-query"]
+  enabled_cloudwatch_logs_exports = ["error", "general", "slowquery"]
   
   tags = {
     Name        = "Axialy Database"
