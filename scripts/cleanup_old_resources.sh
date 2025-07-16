@@ -86,4 +86,68 @@ cleanup_iam_roles() {
     ROLE_NAME="${DB_INSTANCE_IDENTIFIER}-rds-monitoring-role"
     if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
         echo "Detaching policies from role $ROLE_NAME..."
-        aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "arn:aws:
+        aws iam detach-role-policy --role-name "$ROLE_NAME" --policy-arn "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole" || echo "Policy already detached"
+        
+        echo "Deleting IAM role $ROLE_NAME..."
+        aws iam delete-role --role-name "$ROLE_NAME" || echo "Role already deleted"
+    fi
+}
+
+cleanup_ec2_instances() {
+    echo "Cleaning up temporary EC2 instances..."
+    
+    INSTANCE_IDS=$(aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=axialy-db-setup" "Name=instance-state-name,Values=running,stopped,stopping" \
+        --query 'Reservations[].Instances[].InstanceId' \
+        --output text)
+    
+    if [ -n "$INSTANCE_IDS" ]; then
+        echo "Terminating EC2 instances: $INSTANCE_IDS"
+        aws ec2 terminate-instances --instance-ids $INSTANCE_IDS
+        
+        for instance_id in $INSTANCE_IDS; do
+            echo "Waiting for instance $instance_id to terminate..."
+            aws ec2 wait instance-terminated --instance-ids "$instance_id"
+        done
+    fi
+}
+
+cleanup_temp_security_groups() {
+    echo "Cleaning up temporary security groups..."
+    
+    TEMP_SG_IDS=$(aws ec2 describe-security-groups \
+        --filters "Name=group-name,Values=axialy-db-setup-sg" \
+        --query 'SecurityGroups[].GroupId' \
+        --output text)
+    
+    if [ -n "$TEMP_SG_IDS" ]; then
+        for sg_id in $TEMP_SG_IDS; do
+            echo "Deleting temporary security group $sg_id..."
+            aws ec2 delete-security-group --group-id "$sg_id" || echo "Security group already deleted"
+        done
+    fi
+}
+
+main() {
+    echo "=========================================="
+    echo "Axialy AWS Resource Cleanup Script"
+    echo "=========================================="
+    
+    cleanup_rds_instance
+    sleep 10
+    cleanup_security_groups
+    cleanup_parameter_groups
+    cleanup_subnet_groups
+    cleanup_log_groups
+    cleanup_iam_roles
+    cleanup_ec2_instances
+    cleanup_temp_security_groups
+    
+    echo "=========================================="
+    echo "Cleanup completed successfully!"
+    echo "=========================================="
+}
+
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+    main "$@"
+fi
