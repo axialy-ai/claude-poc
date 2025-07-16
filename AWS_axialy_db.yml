@@ -1,0 +1,265 @@
+name: AWS Axialy Database Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      db_instance_identifier:
+        description: "RDS Instance identifier"
+        required: true
+        default: "axialy-database"
+      region:
+        description: "AWS region"
+        default: "us-west-2"
+      instance_class:
+        description: "RDS instance class"
+        default: "db.t3.micro"
+      allocated_storage:
+        description: "Database storage in GB"
+        default: "20"
+
+jobs:
+  prepare:
+    name: Prepare AWS Environment
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.6
+        terraform_wrapper: false
+
+    - name: Terraform init for cleanup
+      working-directory: infra/database
+      run: terraform init -input=false
+
+    - name: Destroy existing resources
+      working-directory: infra/database
+      run: |
+        terraform destroy -auto-approve -input=false \
+          -var="db_instance_identifier=${{ github.event.inputs.db_instance_identifier }}" \
+          -var="region=${{ github.event.inputs.region }}" \
+          -var="instance_class=${{ github.event.inputs.instance_class }}" \
+          -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" \
+          -var="aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" \
+          -var="aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+          -var="admin_default_email=${{ secrets.ADMIN_DEFAULT_EMAIL }}" \
+          -var="admin_default_password=${{ secrets.ADMIN_DEFAULT_PASSWORD }}" \
+          -var="admin_default_user=${{ secrets.ADMIN_DEFAULT_USER }}" \
+          -var="ec2_key_pair=${{ secrets.EC2_KEY_PAIR }}" \
+          -var="ec2_ssh_private_key=${{ secrets.EC2_SSH_PRIVATE_KEY }}" \
+          -var="ec2_elastic_ip_allocation_id=${{ secrets.EC2_ELASTIC_IP_ALLOCATION_ID }}" || true
+
+    - name: Clean Terraform state
+      working-directory: infra/database
+      run: |
+        rm -rf .terraform.lock.hcl
+        rm -rf terraform.tfstate*
+        rm -rf .terraform/
+
+  deploy:
+    name: Deploy Database Infrastructure
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      db_host: ${{ steps.tfout.outputs.db_host }}
+      db_port: ${{ steps.tfout.outputs.db_port }}
+      db_user: ${{ steps.tfout.outputs.db_user }}
+      db_pass: ${{ steps.tfout.outputs.db_pass }}
+      ec2_public_ip: ${{ steps.tfout.outputs.ec2_public_ip }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.6
+        terraform_wrapper: false
+
+    - name: Terraform init
+      working-directory: infra/database
+      run: terraform init -input=false
+
+    - name: Terraform apply
+      id: tfout
+      working-directory: infra/database
+      run: |
+        terraform apply -auto-approve -input=false \
+          -var="db_instance_identifier=${{ github.event.inputs.db_instance_identifier }}" \
+          -var="region=${{ github.event.inputs.region }}" \
+          -var="instance_class=${{ github.event.inputs.instance_class }}" \
+          -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" \
+          -var="aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" \
+          -var="aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+          -var="admin_default_email=${{ secrets.ADMIN_DEFAULT_EMAIL }}" \
+          -var="admin_default_password=${{ secrets.ADMIN_DEFAULT_PASSWORD }}" \
+          -var="admin_default_user=${{ secrets.ADMIN_DEFAULT_USER }}" \
+          -var="ec2_key_pair=${{ secrets.EC2_KEY_PAIR }}" \
+          -var="ec2_ssh_private_key=${{ secrets.EC2_SSH_PRIVATE_KEY }}" \
+          -var="ec2_elastic_ip_allocation_id=${{ secrets.EC2_ELASTIC_IP_ALLOCATION_ID }}"
+
+        echo "db_host=$(terraform output -raw db_host)" >> "$GITHUB_OUTPUT"
+        echo "db_port=$(terraform output -raw db_port)" >> "$GITHUB_OUTPUT"
+        echo "db_user=$(terraform output -raw db_user)" >> "$GITHUB_OUTPUT"
+        echo "db_pass=$(terraform output -raw db_pass)" >> "$GITHUB_OUTPUT"
+        echo "ec2_public_ip=$(terraform output -raw ec2_public_ip)" >> "$GITHUB_OUTPUT"
+
+    - name: Wait for RDS instance to be available
+      run: |
+        echo "Waiting for RDS instance to be available..."
+        aws rds wait db-instance-available --db-instance-identifier ${{ github.event.inputs.db_instance_identifier }} --region ${{ github.event.inputs.region }}
+        echo "RDS instance is available"
+
+    - name: Setup SSH key for EC2 connection
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/axialy_key
+        chmod 600 ~/.ssh/axialy_key
+
+    - name: Load database schemas
+      env:
+        DB_HOST: ${{ steps.tfout.outputs.db_host }}
+        DB_PORT: ${{ steps.tfout.outputs.db_port }}
+        DB_USER: ${{ steps.tfout.outputs.db_user }}
+        DB_PASS: ${{ steps.tfout.outputs.db_pass }}
+        EC2_HOST: ${{ steps.tfout.outputs.ec2_public_ip }}
+      run: |
+        echo "Uploading database schema files to EC2..."
+        scp -i ~/.ssh/axialy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          db/axialy_admin.sql db/axialy_ui.sql \
+          ec2-user@${EC2_HOST}:~/
+
+        echo "Connecting to EC2 and importing schemas..."
+        ssh -i ~/.ssh/axialy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          ec2-user@${EC2_HOST} << 'EOF'
+          
+          echo "Installing MySQL client..."
+          sudo yum update -y
+          sudo yum install -y mysql
+
+          echo "Testing database connection..."
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} -e "SELECT 1;"
+
+          echo "Creating axialy_admin database..."
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} -e "CREATE DATABASE IF NOT EXISTS axialy_admin;"
+
+          echo "Creating axialy_ui database..."
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} -e "CREATE DATABASE IF NOT EXISTS axialy_ui;"
+
+          echo "Importing axialy_admin schema..."
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} axialy_admin < ~/axialy_admin.sql
+
+          echo "Importing axialy_ui schema..."
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} axialy_ui < ~/axialy_ui.sql
+
+          echo "Verifying database structure..."
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} -e "SHOW DATABASES;"
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} axialy_admin -e "SHOW TABLES;"
+          mysql -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p${DB_PASS} axialy_ui -e "SHOW TABLES;"
+
+          echo "Database setup completed successfully!"
+        EOF
+
+    - name: Save DB credentials as repository secrets
+      if: success()
+      env:
+        GH_TOKEN: ${{ secrets.GH_PAT }}
+      run: |
+        if [ -z "$GH_TOKEN" ]; then
+          echo "::warning::GH_PAT secret not set. Cannot update repository secrets automatically."
+          exit 0
+        fi
+
+        gh secret set DB_HOST --body "${{ steps.tfout.outputs.db_host }}"
+        gh secret set DB_PORT --body "${{ steps.tfout.outputs.db_port }}"
+        gh secret set DB_USER --body "${{ steps.tfout.outputs.db_user }}"
+        gh secret set DB_PASSWORD --body "${{ steps.tfout.outputs.db_pass }}"
+        echo "Repository secrets updated successfully"
+
+  cleanup:
+    name: Cleanup Temporary Resources
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ github.event.inputs.region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.6
+        terraform_wrapper: false
+
+    - name: Terraform init
+      working-directory: infra/database
+      run: terraform init -input=false
+
+    - name: Destroy temporary EC2 instance
+      working-directory: infra/database
+      run: |
+        terraform destroy -target=aws_instance.database_setup -auto-approve -input=false \
+          -var="db_instance_identifier=${{ github.event.inputs.db_instance_identifier }}" \
+          -var="region=${{ github.event.inputs.region }}" \
+          -var="instance_class=${{ github.event.inputs.instance_class }}" \
+          -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" \
+          -var="aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" \
+          -var="aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+          -var="admin_default_email=${{ secrets.ADMIN_DEFAULT_EMAIL }}" \
+          -var="admin_default_password=${{ secrets.ADMIN_DEFAULT_PASSWORD }}" \
+          -var="admin_default_user=${{ secrets.ADMIN_DEFAULT_USER }}" \
+          -var="ec2_key_pair=${{ secrets.EC2_KEY_PAIR }}" \
+          -var="ec2_ssh_private_key=${{ secrets.EC2_SSH_PRIVATE_KEY }}" \
+          -var="ec2_elastic_ip_allocation_id=${{ secrets.EC2_ELASTIC_IP_ALLOCATION_ID }}" || true
+
+    - name: Display deployment summary
+      if: needs.deploy.result == 'success'
+      run: |
+        echo "========================================"
+        echo "AWS Axialy Database Deployment Complete!"
+        echo "========================================"
+        echo "RDS Instance: ${{ github.event.inputs.db_instance_identifier }}"
+        echo "Host: ${{ needs.deploy.outputs.db_host }}"
+        echo "Port: ${{ needs.deploy.outputs.db_port }}"
+        echo "User: ${{ needs.deploy.outputs.db_user }}"
+        echo "Region: ${{ github.event.inputs.region }}"
+        echo "========================================"
+        echo ""
+        echo "Databases created:"
+        echo "- axialy_admin"
+        echo "- axialy_ui"
+        echo ""
+        echo "Next steps:"
+        echo "1. Run the 'Axialy Admin' workflow to deploy the application"
+        echo "2. Access the admin interface to complete initialization"
+        echo ""
+        echo "Note: Database credentials have been saved as GitHub secrets"
+        echo "Temporary EC2 instance has been cleaned up"
+        echo "========================================"
