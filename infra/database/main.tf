@@ -1,25 +1,16 @@
-terraform {
-  required_version = ">= 1.6.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    random = {
-      source  = "hashicorp/random"
-      version = "~> 3.0"
-    }
-  }
-}
-
-provider "aws" {
-  region     = var.region
-  access_key = var.aws_access_key_id
-  secret_key = var.aws_secret_access_key
-}
-
 data "aws_availability_zones" "available" {
   state = "available"
+}
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
 }
 
 resource "random_password" "db_password" {
@@ -27,105 +18,57 @@ resource "random_password" "db_password" {
   special = true
 }
 
-resource "aws_vpc" "axialy_vpc" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
+resource "aws_db_parameter_group" "axialy_mysql" {
+  family = "mysql8.0"
+  name   = "${var.db_instance_identifier}-params"
 
-  tags = {
-    Name = "axialy-vpc"
+  parameter {
+    name  = "innodb_buffer_pool_size"
+    value = "{DBInstanceClassMemory*3/4}"
   }
-}
 
-resource "aws_internet_gateway" "axialy_igw" {
-  vpc_id = aws_vpc.axialy_vpc.id
-
-  tags = {
-    Name = "axialy-igw"
+  parameter {
+    name  = "max_connections"
+    value = "100"
   }
-}
 
-resource "aws_subnet" "axialy_public_subnet" {
-  vpc_id                  = aws_vpc.axialy_vpc.id
-  cidr_block              = "10.0.1.0/24"
-  availability_zone       = data.aws_availability_zones.available.names[0]
-  map_public_ip_on_launch = true
-
-  tags = {
-    Name = "axialy-public-subnet"
+  parameter {
+    name  = "innodb_log_file_size"
+    value = "134217728"
   }
-}
 
-resource "aws_subnet" "axialy_private_subnet_1" {
-  vpc_id            = aws_vpc.axialy_vpc.id
-  cidr_block        = "10.0.2.0/24"
-  availability_zone = data.aws_availability_zones.available.names[0]
-
-  tags = {
-    Name = "axialy-private-subnet-1"
+  parameter {
+    name  = "slow_query_log"
+    value = "1"
   }
-}
 
-resource "aws_subnet" "axialy_private_subnet_2" {
-  vpc_id            = aws_vpc.axialy_vpc.id
-  cidr_block        = "10.0.3.0/24"
-  availability_zone = data.aws_availability_zones.available.names[1]
-
-  tags = {
-    Name = "axialy-private-subnet-2"
-  }
-}
-
-resource "aws_route_table" "axialy_public_rt" {
-  vpc_id = aws_vpc.axialy_vpc.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.axialy_igw.id
+  parameter {
+    name  = "long_query_time"
+    value = "2"
   }
 
   tags = {
-    Name = "axialy-public-rt"
+    Name = "Axialy MySQL Parameters"
   }
 }
 
-resource "aws_route_table_association" "axialy_public_rta" {
-  subnet_id      = aws_subnet.axialy_public_subnet.id
-  route_table_id = aws_route_table.axialy_public_rt.id
+resource "aws_db_subnet_group" "axialy" {
+  name       = "${var.db_instance_identifier}-subnet-group"
+  subnet_ids = data.aws_subnets.default.ids
+
+  tags = {
+    Name = "Axialy DB subnet group"
+  }
 }
 
-resource "aws_security_group" "axialy_rds_sg" {
-  name        = "axialy-rds-sg"
+resource "aws_security_group" "axialy_rds" {
+  name        = "${var.db_instance_identifier}-rds-sg"
   description = "Security group for Axialy RDS instance"
-  vpc_id      = aws_vpc.axialy_vpc.id
+  vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    from_port       = 3306
-    to_port         = 3306
-    protocol        = "tcp"
-    security_groups = [aws_security_group.axialy_ec2_sg.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "axialy-rds-sg"
-  }
-}
-
-resource "aws_security_group" "axialy_ec2_sg" {
-  name        = "axialy-ec2-sg"
-  description = "Security group for Axialy EC2 instance"
-  vpc_id      = aws_vpc.axialy_vpc.id
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
+    from_port   = 3306
+    to_port     = 3306
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
@@ -138,34 +81,28 @@ resource "aws_security_group" "axialy_ec2_sg" {
   }
 
   tags = {
-    Name = "axialy-ec2-sg"
+    Name = "Axialy RDS Security Group"
   }
 }
 
-resource "aws_db_subnet_group" "axialy_db_subnet_group" {
-  name       = "axialy-db-subnet-group"
-  subnet_ids = [aws_subnet.axialy_private_subnet_1.id, aws_subnet.axialy_private_subnet_2.id]
-
-  tags = {
-    Name = "axialy-db-subnet-group"
-  }
-}
-
-resource "aws_db_instance" "axialy_database" {
-  identifier                = var.db_instance_identifier
-  engine                    = "mysql"
-  engine_version            = "8.0"
-  instance_class            = var.instance_class
-  allocated_storage         = var.allocated_storage
-  storage_type              = "gp2"
-  storage_encrypted         = true
+resource "aws_db_instance" "axialy" {
+  identifier     = var.db_instance_identifier
+  engine         = "mysql"
+  engine_version = "8.0"
+  instance_class = var.db_instance_class
   
-  db_name  = "axialy"
+  allocated_storage     = var.allocated_storage
+  max_allocated_storage = var.allocated_storage * 2
+  storage_type          = "gp2"
+  storage_encrypted     = true
+  
+  db_name  = "axialy_main"
   username = "axialy_admin"
   password = random_password.db_password.result
   
-  vpc_security_group_ids = [aws_security_group.axialy_rds_sg.id]
-  db_subnet_group_name   = aws_db_subnet_group.axialy_db_subnet_group.name
+  vpc_security_group_ids = [aws_security_group.axialy_rds.id]
+  db_subnet_group_name   = aws_db_subnet_group.axialy.name
+  parameter_group_name   = aws_db_parameter_group.axialy_mysql.name
   
   backup_retention_period = 7
   backup_window          = "03:00-04:00"
@@ -174,45 +111,52 @@ resource "aws_db_instance" "axialy_database" {
   skip_final_snapshot = true
   deletion_protection = false
   
+  performance_insights_enabled = true
+  monitoring_interval         = 60
+  monitoring_role_arn        = aws_iam_role.rds_monitoring.arn
+  
+  enabled_cloudwatch_logs_exports = ["error", "general", "slow-query"]
+  
   tags = {
-    Name = "axialy-database"
+    Name        = "Axialy Database"
+    Environment = "production"
+    Project     = "axialy-ai"
   }
 }
 
-data "aws_ami" "amazon_linux" {
-  most_recent = true
-  owners      = ["amazon"]
+resource "aws_iam_role" "rds_monitoring" {
+  name = "${var.db_instance_identifier}-rds-monitoring-role"
 
-  filter {
-    name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
-  }
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "monitoring.rds.amazonaws.com"
+        }
+      }
+    ]
+  })
 }
 
-resource "aws_instance" "database_setup" {
-  ami                    = data.aws_ami.amazon_linux.id
-  instance_type          = "t3.micro"
-  key_name               = var.ec2_key_pair
-  vpc_security_group_ids = [aws_security_group.axialy_ec2_sg.id]
-  subnet_id              = aws_subnet.axialy_public_subnet.id
-
-  user_data = <<-EOF
-    #!/bin/bash
-    yum update -y
-    yum install -y mysql
-    
-    mkdir -p /home/ec2-user/.axialy
-    chown ec2-user:ec2-user /home/ec2-user/.axialy
-    
-    echo "Database setup instance ready"
-  EOF
-
-  tags = {
-    Name = "axialy-database-setup"
-  }
+resource "aws_iam_role_policy_attachment" "rds_monitoring" {
+  role       = aws_iam_role.rds_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
 }
 
-resource "aws_eip_association" "axialy_eip_assoc" {
-  instance_id   = aws_instance.database_setup.id
-  allocation_id = var.ec2_elastic_ip_allocation_id
+resource "aws_cloudwatch_log_group" "rds_error_log" {
+  name              = "/aws/rds/instance/${var.db_instance_identifier}/error"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "rds_general_log" {
+  name              = "/aws/rds/instance/${var.db_instance_identifier}/general"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "rds_slow_query_log" {
+  name              = "/aws/rds/instance/${var.db_instance_identifier}/slowquery"
+  retention_in_days = 7
 }
