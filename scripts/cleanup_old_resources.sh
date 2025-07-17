@@ -68,8 +68,6 @@ cleanup_log_groups() {
     
     LOG_GROUPS=(
         "/aws/rds/instance/${DB_INSTANCE_IDENTIFIER}/error"
-        "/aws/rds/instance/${DB_INSTANCE_IDENTIFIER}/general"
-        "/aws/rds/instance/${DB_INSTANCE_IDENTIFIER}/slowquery"
     )
     
     for log_group in "${LOG_GROUPS[@]}"; do
@@ -90,6 +88,8 @@ cleanup_iam_roles() {
         
         echo "Deleting IAM role $ROLE_NAME..."
         aws iam delete-role --role-name "$ROLE_NAME" || echo "Role already deleted"
+    else
+        echo "No IAM roles found to cleanup"
     fi
 }
 
