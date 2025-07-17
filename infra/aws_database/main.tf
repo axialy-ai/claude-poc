@@ -23,28 +23,33 @@ resource "aws_db_parameter_group" "axialy_mysql" {
   name   = "${var.db_instance_identifier}-params"
 
   parameter {
-    name  = "innodb_buffer_pool_size"
-    value = "{DBInstanceClassMemory*3/4}"
+    name         = "innodb_buffer_pool_size"
+    value        = "134217728"
+    apply_method = "pending-reboot"
   }
 
   parameter {
-    name  = "max_connections"
-    value = "100"
+    name         = "max_connections"
+    value        = "50"
+    apply_method = "immediate"
   }
 
   parameter {
-    name  = "innodb_log_file_size"
-    value = "134217728"
+    name         = "innodb_log_file_size"
+    value        = "67108864"
+    apply_method = "pending-reboot"
   }
 
   parameter {
-    name  = "slow_query_log"
-    value = "1"
+    name         = "slow_query_log"
+    value        = "0"
+    apply_method = "immediate"
   }
 
   parameter {
-    name  = "long_query_time"
-    value = "2"
+    name         = "general_log"
+    value        = "0"
+    apply_method = "immediate"
   }
 
   tags = {
@@ -66,11 +71,13 @@ resource "aws_security_group" "axialy_rds" {
   description = "Security group for Axialy RDS instance"
   vpc_id      = data.aws_vpc.default.id
 
+  # Allow MySQL/Aurora connections from anywhere (will be restricted during setup)
   ingress {
     from_port   = 3306
     to_port     = 3306
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "MySQL access from anywhere (temporary for setup)"
   }
 
   egress {
@@ -88,13 +95,13 @@ resource "aws_security_group" "axialy_rds" {
 resource "aws_db_instance" "axialy" {
   identifier     = var.db_instance_identifier
   engine         = "mysql"
-  engine_version = "8.0"
+  engine_version = "8.0.35"
   instance_class = var.db_instance_class
   
   allocated_storage     = var.allocated_storage
-  max_allocated_storage = var.allocated_storage * 2
+  max_allocated_storage = 0
   storage_type          = "gp2"
-  storage_encrypted     = true
+  storage_encrypted     = false
   
   db_name  = "axialy_main"
   username = "axialy_admin"
@@ -104,18 +111,22 @@ resource "aws_db_instance" "axialy" {
   db_subnet_group_name   = aws_db_subnet_group.axialy.name
   parameter_group_name   = aws_db_parameter_group.axialy_mysql.name
   
-  backup_retention_period = 7
+  # Make it publicly accessible for initial setup
+  publicly_accessible = true
+  
+  backup_retention_period = 1
   backup_window          = "03:00-04:00"
   maintenance_window     = "sun:04:00-sun:05:00"
   
   skip_final_snapshot = true
   deletion_protection = false
   
-  performance_insights_enabled = true
-  monitoring_interval         = 60
-  monitoring_role_arn        = aws_iam_role.rds_monitoring.arn
+  performance_insights_enabled = false
+  monitoring_interval         = 0
   
-  enabled_cloudwatch_logs_exports = ["error", "general", "slowquery"]
+  enabled_cloudwatch_logs_exports = []
+  
+  apply_immediately = true
   
   tags = {
     Name        = "Axialy Database"
@@ -124,39 +135,11 @@ resource "aws_db_instance" "axialy" {
   }
 }
 
-resource "aws_iam_role" "rds_monitoring" {
-  name = "${var.db_instance_identifier}-rds-monitoring-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "monitoring.rds.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "rds_monitoring" {
-  role       = aws_iam_role.rds_monitoring.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
-}
-
 resource "aws_cloudwatch_log_group" "rds_error_log" {
   name              = "/aws/rds/instance/${var.db_instance_identifier}/error"
-  retention_in_days = 7
-}
-
-resource "aws_cloudwatch_log_group" "rds_general_log" {
-  name              = "/aws/rds/instance/${var.db_instance_identifier}/general"
-  retention_in_days = 7
-}
-
-resource "aws_cloudwatch_log_group" "rds_slow_query_log" {
-  name              = "/aws/rds/instance/${var.db_instance_identifier}/slowquery"
-  retention_in_days = 7
+  retention_in_days = 1
+  
+  tags = {
+    Name = "Axialy RDS Error Logs"
+  }
 }

@@ -48,3 +48,13 @@ output "subnet_group_name" {
   description = "DB subnet group name"
   value       = aws_db_subnet_group.axialy.name
 }
+
+output "estimated_monthly_cost" {
+  description = "Estimated monthly cost breakdown"
+  value = {
+    rds_instance = "~$13-15 USD (db.t4g.micro)"
+    storage_20gb = "~$2-3 USD (20GB gp2)"
+    backup_1day  = "~$0-1 USD (1 day retention)"
+    total_estimate = "~$15-19 USD per month"
+  }
+}

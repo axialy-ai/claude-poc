@@ -16,7 +16,7 @@ variable "db_instance_identifier" {
 variable "db_instance_class" {
   description = "RDS instance class"
   type        = string
-  default     = "db.t3.micro"
+  default     = "db.t4g.micro"
   validation {
     condition     = can(regex("^db\\.[a-z0-9]+\\.[a-z]+$", var.db_instance_class))
     error_message = "DB instance class must be a valid AWS RDS instance class."
