@@ -13,7 +13,7 @@ on:
         required: true
       db_instance_class:
         description: "RDS instance class"
-        default: "db.t3.micro"
+        default: "db.t4g.micro"
         required: true
       allocated_storage:
         description: "Allocated storage in GB"
@@ -69,6 +69,56 @@ jobs:
         
         echo "Cleanup completed"
 
+    - name: Force cleanup all related resources
+      run: |
+        echo "Performing comprehensive cleanup of all related resources..."
+        
+        # Cleanup any existing EC2 instances
+        EXISTING_INSTANCES=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=axialy-db-setup" "Name=instance-state-name,Values=running,pending,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' --output text || echo "")
+        if [ ! -z "$EXISTING_INSTANCES" ]; then
+          echo "Terminating existing EC2 instances: $EXISTING_INSTANCES"
+          aws ec2 terminate-instances --instance-ids $EXISTING_INSTANCES || true
+          aws ec2 wait instance-terminated --instance-ids $EXISTING_INSTANCES || true
+        fi
+        
+        # Cleanup existing security groups
+        EXISTING_SETUP_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=axialy-db-setup-sg" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+        if [ "$EXISTING_SETUP_SG" != "None" ] && [ "$EXISTING_SETUP_SG" != "" ]; then
+          echo "Deleting existing setup security group: $EXISTING_SETUP_SG"
+          aws ec2 delete-security-group --group-id "$EXISTING_SETUP_SG" || true
+        fi
+        
+        # Cleanup parameter groups
+        PARAM_GROUP_NAME="${{ env.DB_INSTANCE_IDENTIFIER }}-params"
+        if aws rds describe-db-parameter-groups --db-parameter-group-name "$PARAM_GROUP_NAME" 2>/dev/null; then
+          echo "Deleting parameter group $PARAM_GROUP_NAME..."
+          aws rds delete-db-parameter-group --db-parameter-group-name "$PARAM_GROUP_NAME" || true
+        fi
+        
+        # Cleanup subnet groups  
+        SUBNET_GROUP_NAME="${{ env.DB_INSTANCE_IDENTIFIER }}-subnet-group"
+        if aws rds describe-db-subnet-groups --db-subnet-group-name "$SUBNET_GROUP_NAME" 2>/dev/null; then
+          echo "Deleting subnet group $SUBNET_GROUP_NAME..."
+          aws rds delete-db-subnet-group --db-subnet-group-name "$SUBNET_GROUP_NAME" || true
+        fi
+        
+        # Cleanup security groups
+        SG_NAME="${{ env.DB_INSTANCE_IDENTIFIER }}-rds-sg" 
+        SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SG_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+        if [ "$SG_ID" != "None" ] && [ "$SG_ID" != "" ]; then
+          echo "Deleting security group $SG_ID..."
+          aws ec2 delete-security-group --group-id "$SG_ID" || true
+        fi
+        
+        # Cleanup CloudWatch log groups
+        LOG_GROUP="/aws/rds/instance/${{ env.DB_INSTANCE_IDENTIFIER }}/error"
+        if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query 'logGroups[0].logGroupName' --output text 2>/dev/null | grep -q "$LOG_GROUP"; then
+          echo "Deleting log group $LOG_GROUP..."
+          aws logs delete-log-group --log-group-name "$LOG_GROUP" || true
+        fi
+        
+        echo "✓ Comprehensive cleanup completed"
+
   deploy:
     runs-on: ubuntu-latest
     name: Deploy RDS and Configure Databases
@@ -92,6 +142,11 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ github.event.inputs.aws_region }}
 
+    - name: Wait for cleanup completion
+      run: |
+        echo "Waiting 30 seconds for AWS resource cleanup to propagate..."
+        sleep 30
+
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v3
       with:
@@ -110,6 +165,54 @@ jobs:
           -var="aws_region=${{ github.event.inputs.aws_region }}" \
           -var="db_instance_class=${{ github.event.inputs.db_instance_class }}" \
           -var="allocated_storage=${{ github.event.inputs.allocated_storage }}"
+
+    - name: Import existing resources if they exist
+      working-directory: infra/aws_database
+      run: |
+        # Create import helper script
+        cat > import_existing.sh << 'EOF'
+        #!/bin/bash
+        set +e  # Don't exit on errors for imports
+        
+        # Import parameter group if exists
+        PARAM_GROUP="${{ env.DB_INSTANCE_IDENTIFIER }}-params"
+        if aws rds describe-db-parameter-groups --db-parameter-group-name "$PARAM_GROUP" >/dev/null 2>&1; then
+          echo "Importing parameter group: $PARAM_GROUP"
+          terraform import -var="db_instance_identifier=${{ env.DB_INSTANCE_IDENTIFIER }}" -var="aws_region=${{ github.event.inputs.aws_region }}" -var="db_instance_class=${{ github.event.inputs.db_instance_class }}" -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" aws_db_parameter_group.axialy_mysql "$PARAM_GROUP"
+        fi
+        
+        # Import subnet group if exists
+        SUBNET_GROUP="${{ env.DB_INSTANCE_IDENTIFIER }}-subnet-group"
+        if aws rds describe-db-subnet-groups --db-subnet-group-name "$SUBNET_GROUP" >/dev/null 2>&1; then
+          echo "Importing subnet group: $SUBNET_GROUP"
+          terraform import -var="db_instance_identifier=${{ env.DB_INSTANCE_IDENTIFIER }}" -var="aws_region=${{ github.event.inputs.aws_region }}" -var="db_instance_class=${{ github.event.inputs.db_instance_class }}" -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" aws_db_subnet_group.axialy "$SUBNET_GROUP"
+        fi
+        
+        # Import security group if exists
+        SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=${{ env.DB_INSTANCE_IDENTIFIER }}-rds-sg" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+        if [ "$SG_ID" != "None" ] && [ "$SG_ID" != "" ]; then
+          echo "Importing security group: $SG_ID"
+          terraform import -var="db_instance_identifier=${{ env.DB_INSTANCE_IDENTIFIER }}" -var="aws_region=${{ github.event.inputs.aws_region }}" -var="db_instance_class=${{ github.event.inputs.db_instance_class }}" -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" aws_security_group.axialy_rds "$SG_ID"
+        fi
+        
+        # Import log group if exists
+        LOG_GROUP="/aws/rds/instance/${{ env.DB_INSTANCE_IDENTIFIER }}/error"
+        if aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" --query 'logGroups[0].logGroupName' --output text 2>/dev/null | grep -q "$LOG_GROUP"; then
+          echo "Importing log group: $LOG_GROUP"
+          terraform import -var="db_instance_identifier=${{ env.DB_INSTANCE_IDENTIFIER }}" -var="aws_region=${{ github.event.inputs.aws_region }}" -var="db_instance_class=${{ github.event.inputs.db_instance_class }}" -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" aws_cloudwatch_log_group.rds_error_log "$LOG_GROUP"
+        fi
+        
+        # Import RDS instance if exists
+        if aws rds describe-db-instances --db-instance-identifier "${{ env.DB_INSTANCE_IDENTIFIER }}" >/dev/null 2>&1; then
+          echo "Importing RDS instance: ${{ env.DB_INSTANCE_IDENTIFIER }}"
+          terraform import -var="db_instance_identifier=${{ env.DB_INSTANCE_IDENTIFIER }}" -var="aws_region=${{ github.event.inputs.aws_region }}" -var="db_instance_class=${{ github.event.inputs.db_instance_class }}" -var="allocated_storage=${{ github.event.inputs.allocated_storage }}" aws_db_instance.axialy "${{ env.DB_INSTANCE_IDENTIFIER }}"
+        fi
+        
+        set -e  # Re-enable exit on errors
+        EOF
+        
+        chmod +x import_existing.sh
+        ./import_existing.sh || echo "Import completed with some resources already managed"
 
     - name: Terraform Apply
       id: deploy_rds
@@ -131,6 +234,14 @@ jobs:
       run: |
         VPC_ID=$(aws ec2 describe-vpcs --filters "Name=is-default,Values=true" --query 'Vpcs[0].VpcId' --output text)
         
+        # Check if security group already exists and delete it
+        EXISTING_SG=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=axialy-db-setup-sg" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
+        if [ "$EXISTING_SG" != "None" ] && [ "$EXISTING_SG" != "" ]; then
+          echo "Deleting existing security group: $EXISTING_SG"
+          aws ec2 delete-security-group --group-id "$EXISTING_SG" || true
+          sleep 5  # Wait for deletion to propagate
+        fi
+        
         SECURITY_GROUP_ID=$(aws ec2 create-security-group \
           --group-name axialy-db-setup-sg \
           --description "Temporary security group for Axialy DB setup" \
@@ -146,9 +257,18 @@ jobs:
         
         SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[0].SubnetId' --output text)
         
+        # Get the latest Amazon Linux 2023 AMI ID for the current region
+        AMI_ID=$(aws ec2 describe-images \
+          --owners amazon \
+          --filters "Name=name,Values=al2023-ami-*-x86_64" "Name=state,Values=available" \
+          --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \
+          --output text)
+        
+        echo "Using AMI: $AMI_ID"
+        
         INSTANCE_ID=$(aws ec2 run-instances \
-          --image-id ami-0c02fb55956c7d316 \
-          --instance-type t3.micro \
+          --image-id $AMI_ID \
+          --instance-type t3.nano \
           --key-name ${{ secrets.EC2_KEY_PAIR }} \
           --security-group-ids $SECURITY_GROUP_ID \
           --subnet-id $SUBNET_ID \
